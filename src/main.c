@@ -8,14 +8,20 @@
 
 
 
-int main(void)
+int main(int argc, char **argv)
 {
-    char *greeting = get_greeting("World");
-    if (greeting) {
-        printf("%s\n", greeting);
-        free(greeting); // Free the allocated memory for the greeting
-    } else {
-        printf("Failed to create greeting.\n");
+    struct smtp_config cfg;
+    int rc = parse_args(argc, argv, &cfg);
+
+    // no args check
+    if (rc == -1) {
+        return 0;
+    } 
+
+    // wrong args check
+    if (rc != 0) {
+        return 1;
     }
+
     return 0;
 }

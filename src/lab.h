@@ -23,7 +23,10 @@ struct smtp_config {
 
 int parse_args(int argc, char **argv, struct smtp_config *cfg);
 
-
 void print_usage(FILE *out);
+
+int connect_to_server(const char *host, const char *port);
+
+
 
 #endif // LAB_H

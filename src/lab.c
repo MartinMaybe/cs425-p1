@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <errno.h>
 
 char *get_greeting(const char *restrict name)
 {
@@ -123,4 +126,43 @@ int parse_args(int argc, char **argv, struct smtp_config *cfg) {
   }
 
   return 0;
+}
+
+// connecting to server
+int connect_to_server(const char *host, const char *port) {
+  struct addrinfo hints, *res, *rp;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  int gai_err = getaddrinfo(host, port, &hints, &res);
+  if (gai_err != 0) {
+    fprintf(stderr, "myapp: could not resoolve %s: %s\n", 
+            host, gai_strerror(gai_err));
+    return -1;
+  }
+
+  int fd = -1;
+  for (rp = res; rp != NULL; rp = rp->ai_next) {
+    fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (fd == -1) {
+      continue; // try next connection
+    }
+    if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+      break; // worked, save this connection
+    }
+
+    // fail to connect, close
+    close(fd);
+    fd = -1;
+  }
+
+  freeaddrinfo(res);
+
+  if (fd == -1) {
+    fprintf(stderr, "myapp: could not conect to %s:%s\n", host, port);
+    return -1;
+  }
+
+  return fd;
 }

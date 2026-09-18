@@ -137,7 +137,7 @@ int connect_to_server(const char *host, const char *port) {
 
   int gai_err = getaddrinfo(host, port, &hints, &res);
   if (gai_err != 0) {
-    fprintf(stderr, "myapp: could not resoolve %s: %s\n", 
+    fprintf(stderr, "myapp: could not resolve %s: %s\n", 
             host, gai_strerror(gai_err));
     return -1;
   }
@@ -160,9 +160,177 @@ int connect_to_server(const char *host, const char *port) {
   freeaddrinfo(res);
 
   if (fd == -1) {
-    fprintf(stderr, "myapp: could not conect to %s:%s\n", host, port);
+    fprintf(stderr, "myapp: could not connect to %s:%s\n", host, port);
     return -1;
   }
 
   return fd;
+}
+
+// Read Lines
+
+static int read_line(int fd, char *out, size_t outsize) {
+  size_t n = 0;
+  char ch;
+
+  for (;;) {
+    ssize_t r = read(fd, &ch, 1);
+    if (r<= 0) {
+      return -1;
+    }
+    if (ch == '\n') {
+      if (n > 0 && out[n-1] == '\r') {
+        n--;
+      } 
+      out[n] = '\0';
+      return (int)n;
+    }
+    if (n + 1 >= outsize) {
+      return -1;
+    }
+    out[n++] = ch;
+  }
+  
+}
+
+int read_reply(int fd, reply_t *out) {
+    char line[LINE_MAX_LEN];
+    out->text[0] = '\0';
+
+    for (;;) {
+        int len = read_line(fd, line, sizeof(line));
+        if (len < 4) return -1; /* too short to have a valid code+sep */
+
+        strncat(out->text, line, sizeof(out->text) - strlen(out->text) - 1);
+        strncat(out->text, "\n", sizeof(out->text) - strlen(out->text) - 1);
+
+        char sep = line[3];
+        if (sep == ' ') {
+            line[3] = '\0';
+            out->code = atoi(line);
+            return 0;
+        }
+        if (sep != '-') return -1; /* malformed reply */
+    }
+}
+
+int expect_reply(int fd, int expected_code, reply_t *out) {
+  if (read_reply(fd, out) != 0) {
+    fprintf(stderr, "myapp: failed to read server reply\n");
+    return -1;
+  }
+
+  if (out->code != expected_code) {
+    fprintf(stderr, "myapp: expected %d but server replied: %s",
+            expected_code, out->text);
+    return -1;
+  }
+
+  return 0;
+}
+
+int send_line(int fd, const char *line) {
+  char buf[LINE_MAX_LEN];
+
+  int n = snprintf(buf, sizeof(buf), "%s\r\n", line);
+  if (n < 0 || (size_t)n >= sizeof(buf)) {
+    fprintf(stderr, "myapp: command too long: %s\n", line);
+    return -1;
+  }
+
+  ssize_t total = 0;
+  while ((size_t)total < (size_t)n) {
+    ssize_t written = write(fd, buf + total, (size_t)n - (size_t)total);
+    if (written <= 0) {
+        fprintf(stderr, "myapp: failed to send command\n");
+        return -1;
+      }
+      total += written;
+  }
+  return 0;
+}
+
+int send_body(int fd, const char *body) {
+  const char *line_start = body;
+
+  while (*line_start != '\0') {
+    const char *newline = strchr(line_start, '\n');
+    size_t linelen = newline ? (size_t)(newline - line_start) : strlen(line_start);
+
+    if (linelen > 0 && line_start[linelen - 1] == '\r') {
+      linelen--;
+    }
+
+    char out_line[LINE_MAX_LEN];
+    int n;
+    if (linelen > 0 && line_start[0] == '.') {
+      n = snprintf(out_line, sizeof(out_line), ".%.*s", (int)linelen, line_start);
+    } else {
+      n = snprintf(out_line, sizeof(out_line), "%.*s", (int)linelen, line_start);
+    }
+
+    if (n < 0 || (size_t)n >= sizeof(out_line)) {
+      fprintf(stderr, "myapp: body line too long\n");
+      return -1;
+    }
+    if (send_line(fd, out_line) != 0) {
+      return -1;
+    }
+
+    if (!newline) {
+      break;
+    } 
+    line_start = newline + 1;
+  }
+
+  if (send_line(fd, ".") != 0) {
+    return -1;
+  }
+  
+  return 0;
+}
+
+char *read_stdin_body(void) {
+    size_t capacity = 4096;
+    size_t used = 0;
+    char *buf = malloc(capacity);
+    if (!buf) {
+        return NULL;
+    }
+
+    for (;;) {
+        if (used == capacity) {
+            size_t new_capacity = capacity * 2;
+            char *bigger = realloc(buf, new_capacity);
+            if (!bigger) {
+                free(buf);
+                return NULL;
+            }
+            buf = bigger;
+            capacity = new_capacity;
+        }
+
+        ssize_t n = read(STDIN_FILENO, buf + used, capacity - used);
+        if (n < 0) {
+            free(buf);
+            return NULL;
+        }
+        if (n == 0) {
+            break; /* EOF */
+        }
+        used += (size_t)n;
+    }
+
+    /* need room for the NUL terminator */
+    if (used == capacity) {
+        char *bigger = realloc(buf, capacity + 1);
+        if (!bigger) {
+            free(buf);
+            return NULL;
+        }
+        buf = bigger;
+    }
+    buf[used] = '\0';
+
+    return buf;
 }

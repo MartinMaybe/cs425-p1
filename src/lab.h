@@ -1,6 +1,8 @@
 #ifndef LAB_H
 #define LAB_H
 #include <stdio.h>
+#include <stddef.h>
+#include <sys/types.h>
 
 #define LINE_MAX_LEN 512
 
@@ -23,26 +25,49 @@ struct smtp_config {
     const char *server;
 };
 
-
 typedef struct {
     int code;
     char text[2048];
 } reply_t;
 
-int read_reply(int fd, reply_t *out);
+// Layer 2
 
-int parse_args(int argc, char **argv, struct smtp_config *cfg);
+// Function pointer type for reading bytes from transporter
+typedef ssize_t (*read_fn)(void *p, char *buf, size_t len);
+// Function pointer type for writing bytes to transporter
+typedef ssize_t (*write_fn)(void *p, const char *buf, size_t len);
 
-void print_usage(FILE *out);
+// Struct for transporter read/write
+typedef struct {
+    read_fn read;
+    write_fn write;
+    void *p;
+} smtp_t;
+
+int read_line(smtp_t *io, char *out, size_t outsize);
+int read_reply(smtp_t *io, reply_t *out);
+int expect_reply(smtp_t *io, int expected_code, reply_t *out);
+int send_line(smtp_t *io, const char *line);
+int send_body(smtp_t *io, const char *body);
+
+// Runs SMPT conversation over transport 
+int run_smtp_session(smtp_t *io, const struct smtp_config *cfg, const char *body);
+
+// Layer 1
+int parse_reply_line(const char *line, int *code, int *is_final);
+int dot_stuff_line(const char *line, size_t linelen, char *out, size_t outsize);
+
+// Layer 3
 
 int connect_to_server(const char *host, const char *port);
+// read with TCP socket
+ssize_t socket_read_cb(void *p, char *buf, size_t len);
+// write with TCP socket
+ssize_t socket_write_cb(void *p, const char *buf, size_t len);
 
-int expect_reply(int fd, int expected_code, reply_t *out);
-
-int send_line(int fd, const char *line);
-
-int send_body(int fd, const char *body);
-
+// other
+int parse_args(int argc, char **argv, struct smtp_config *cfg);
+void print_usage(FILE *out);
 char* read_stdin_body(void);
 
 #endif // LAB_H

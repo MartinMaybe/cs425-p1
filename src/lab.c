@@ -167,14 +167,24 @@ int connect_to_server(const char *host, const char *port) {
   return fd;
 }
 
+ssize_t socket_read_cb(void *ctx, char *buf, size_t len) {
+  int fd = *(int *)ctx;
+  return read(fd, buf, len);
+}
+
+ssize_t socket_write_cb(void *ctx, const char *buf, size_t len) {
+  int fd = *(int *)ctx;
+  return write(fd, buf, len);
+}
+
 // Read Lines
 
-static int read_line(int fd, char *out, size_t outsize) {
+int read_line(smtp_t *io, char *out, size_t outsize) {
   size_t n = 0;
   char ch;
 
   for (;;) {
-    ssize_t r = read(fd, &ch, 1);
+    ssize_t r = io->read(io->p, &ch, 1);
     if (r<= 0) {
       return -1;
     }
@@ -193,29 +203,57 @@ static int read_line(int fd, char *out, size_t outsize) {
   
 }
 
-int read_reply(int fd, reply_t *out) {
+int read_reply(smtp_t *io, reply_t *out) {
     char line[LINE_MAX_LEN];
     out->text[0] = '\0';
 
     for (;;) {
-        int len = read_line(fd, line, sizeof(line));
-        if (len < 4) return -1; /* too short to have a valid code+sep */
+        int len = read_line(io, line, sizeof(line));
+        if (len < 0) return -1; /* too short to have a valid code+sep */
 
         strncat(out->text, line, sizeof(out->text) - strlen(out->text) - 1);
         strncat(out->text, "\n", sizeof(out->text) - strlen(out->text) - 1);
 
-        char sep = line[3];
-        if (sep == ' ') {
-            line[3] = '\0';
-            out->code = atoi(line);
+        int code, is_final;
+        if (parse_reply_line(line, &code, &is_final) != 0) {
+            return -1; /* malformed reply line */
+        }
+        if (is_final) {
+            out->code = code;
             return 0;
         }
-        if (sep != '-') return -1; /* malformed reply */
     }
 }
 
-int expect_reply(int fd, int expected_code, reply_t *out) {
-  if (read_reply(fd, out) != 0) {
+int dot_stuff_line(const char *line, size_t linelen, char *out, size_t outsize) {
+    int n;
+    if (linelen > 0 && line[0] == '.') {
+        n = snprintf(out, outsize, ".%.*s", (int)linelen, line);
+    } else {
+        n = snprintf(out, outsize, "%.*s", (int)linelen, line);
+    }
+    if (n < 0 || (size_t)n >= outsize) {
+        return -1;
+    }
+    return n;
+}
+
+int parse_reply_line(const char *line, int *code, int *is_final) {
+    if (strlen(line) < 4) {
+        return -1;
+    }
+    char sep = line[3];
+    if (sep != ' ' && sep != '-') {
+        return -1;
+    }
+    char code_buf[4] = { line[0], line[1], line[2], '\0' };
+    *code = atoi(code_buf);
+    *is_final = (sep == ' ') ? 1 : 0;
+    return 0;
+}
+
+int expect_reply(smtp_t *io, int expected_code, reply_t *out) {
+  if (read_reply(io, out) != 0) {
     fprintf(stderr, "myapp: failed to read server reply\n");
     return -1;
   }
@@ -229,18 +267,16 @@ int expect_reply(int fd, int expected_code, reply_t *out) {
   return 0;
 }
 
-int send_line(int fd, const char *line) {
+int send_line(smtp_t *io, const char *line) {
   char buf[LINE_MAX_LEN];
-
   int n = snprintf(buf, sizeof(buf), "%s\r\n", line);
   if (n < 0 || (size_t)n >= sizeof(buf)) {
     fprintf(stderr, "myapp: command too long: %s\n", line);
     return -1;
   }
-
   ssize_t total = 0;
   while ((size_t)total < (size_t)n) {
-    ssize_t written = write(fd, buf + total, (size_t)n - (size_t)total);
+    ssize_t written = io->write(io->p, buf + total, (size_t)n - (size_t)total);
     if (written <= 0) {
         fprintf(stderr, "myapp: failed to send command\n");
         return -1;
@@ -250,7 +286,7 @@ int send_line(int fd, const char *line) {
   return 0;
 }
 
-int send_body(int fd, const char *body) {
+int send_body(smtp_t *io, const char *body) {
   const char *line_start = body;
 
   while (*line_start != '\0') {
@@ -262,18 +298,11 @@ int send_body(int fd, const char *body) {
     }
 
     char out_line[LINE_MAX_LEN];
-    int n;
-    if (linelen > 0 && line_start[0] == '.') {
-      n = snprintf(out_line, sizeof(out_line), ".%.*s", (int)linelen, line_start);
-    } else {
-      n = snprintf(out_line, sizeof(out_line), "%.*s", (int)linelen, line_start);
-    }
-
-    if (n < 0 || (size_t)n >= sizeof(out_line)) {
+    if (dot_stuff_line(line_start, linelen, out_line, sizeof(out_line)) < 0) {
       fprintf(stderr, "myapp: body line too long\n");
       return -1;
     }
-    if (send_line(fd, out_line) != 0) {
+    if (send_line(io, out_line) != 0) {
       return -1;
     }
 
@@ -283,7 +312,7 @@ int send_body(int fd, const char *body) {
     line_start = newline + 1;
   }
 
-  if (send_line(fd, ".") != 0) {
+  if (send_line(io, ".") != 0) {
     return -1;
   }
   
@@ -333,4 +362,47 @@ char *read_stdin_body(void) {
     buf[used] = '\0';
 
     return buf;
+}
+
+// Runs the whole SMTP conversation. 
+int run_smtp_session(smtp_t *io, const struct smtp_config *cfg,
+                     const char *body) {
+    reply_t reply;
+    char cmd[LINE_MAX_LEN];
+
+    snprintf(cmd, sizeof(cmd), "HELO %s", cfg->helo_host);
+    if (send_line(io, cmd) != 0) return -1;
+    if (expect_reply(io, 250, &reply) != 0) return -1;
+    printf("HELO ok: %s", reply.text);
+
+    snprintf(cmd, sizeof(cmd), "MAIL FROM:<%s>", cfg->from);
+    if (send_line(io, cmd) != 0) return -1;
+    if (expect_reply(io, 250, &reply) != 0) return -1;
+    printf("MAIL FROM ok: %s", reply.text);
+
+    snprintf(cmd, sizeof(cmd), "RCPT TO:<%s>", cfg->to);
+    if (send_line(io, cmd) != 0) return -1;
+    if (expect_reply(io, 250, &reply) != 0) return -1;
+    printf("RCPT TO ok: %s", reply.text);
+
+    if (send_line(io, "DATA") != 0) return -1;
+    if (expect_reply(io, 354, &reply) != 0) return -1;
+
+    snprintf(cmd, sizeof(cmd), "From: %s", cfg->from);
+    if (send_line(io, cmd) != 0) return -1;
+    snprintf(cmd, sizeof(cmd), "To: %s", cfg->to);
+    if (send_line(io, cmd) != 0) return -1;
+    snprintf(cmd, sizeof(cmd), "Subject: %s", cfg->subject);
+    if (send_line(io, cmd) != 0) return -1;
+    if (send_line(io, "") != 0) return -1;
+
+    if (send_body(io, body) != 0) return -1;
+    if (expect_reply(io, 250, &reply) != 0) return -1;
+    printf("DATA ok: %s", reply.text);
+
+    if (send_line(io, "QUIT") != 0) return -1;
+    if (expect_reply(io, 221, &reply) != 0) return -1;
+    printf("QUIT ok: %s", reply.text);
+
+    return 0;
 }
